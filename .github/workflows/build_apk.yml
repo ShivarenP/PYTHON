@@ -26,7 +26,6 @@ jobs:
         with:
           distribution: "temurin"
           java-version: "17"
-          cache: "gradle"
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -42,7 +41,7 @@ jobs:
           APP_DIR=$(dirname "$(find . -maxdepth 3 -name "main.py" | head -n 1)")
           echo "Building Flet APK inside: $APP_DIR"
           cd "$APP_DIR"
-          flet build apk --yes
+          flet build apk --arch arm64-v8a --yes
           APK_FILE=$(find build/apk -name "*.apk" | head -n 1)
           echo "Copying generated APK: $APK_FILE"
           cp "$APK_FILE" "$GITHUB_WORKSPACE/Chiron-LIS-Simulator.apk"
