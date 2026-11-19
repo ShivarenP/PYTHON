@@ -7,7 +7,7 @@ from datetime import datetime
 
 import flet as ft
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 GITHUB_REPO = "ShivarenP/PYTHON"
 
 # Control bytes
@@ -22,18 +22,28 @@ LF = b"\x0a"
 VT = b"\x0b"
 FS = b"\x1c"
 
-ASTM_PRESET = """H|\\^&|||CHIRON^SIM|||||||P|1
-P|1||PAT001||DOE^JOHN||19850412|M
-O|1|TUBE001||^^^GLU\\^^^NA\\^^^K|R
-R|1|^^^GLU|5.4|mmol/L|3.9-5.8|N||F
-R|2|^^^NA|140|mmol/L|135-145|N||F
-R|3|^^^K|4.2|mmol/L|3.5-5.1|N||F
-L|1|N"""
 
-HL7_PRESET = """MSH|^~\\&|CHIRON|LAB|LIS|HOSP|20261119130000||ORU^R01|MSG001|P|2.5
-PID|1||PAT001||DOE^JOHN||19850412|M
-OBR|1||TUBE001|CHEM^Chemistry Panel
-OBX|1|NM|GLU^Glucose||5.4|mmol/L|3.9-5.8|N|||F"""
+def make_astm_preset() -> str:
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    return (
+        f"H|\\^&|||CHIRON^SIM|||||||P|1|{ts}\n"
+        "P|1||PAT001||DOE^JOHN||19850412|M\n"
+        "O|1|TUBE001||^^^GLU\\^^^NA\\^^^K|R\n"
+        f"R|1|^^^GLU|5.4|mmol/L|3.9-5.8|N||F||||{ts}\n"
+        f"R|2|^^^NA|140|mmol/L|135-145|N||F||||{ts}\n"
+        f"R|3|^^^K|4.2|mmol/L|3.5-5.1|N||F||||{ts}\n"
+        "L|1|N"
+    )
+
+
+def make_hl7_preset() -> str:
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    return (
+        f"MSH|^~\\&|CHIRON|LAB|LIS|HOSP|{ts}||ORU^R01|MSG001|P|2.5\n"
+        "PID|1||PAT001||DOE^JOHN||19850412|M\n"
+        "OBR|1||TUBE001|CHEM^Chemistry Panel\n"
+        f"OBX|1|NM|GLU^Glucose||5.4|mmol/L|3.9-5.8|N|||F|||{ts}"
+    )
 
 
 def astm_checksum(frame_body: bytes) -> bytes:
@@ -93,6 +103,7 @@ def main(page: ft.Page):
     page.padding = 14
     page.scroll = ft.ScrollMode.AUTO
 
+    state = {"sock": None, "target": None}
     log_lines: list[str] = [f"[{datetime.now().strftime('%H:%M:%S')}] Ready (v{APP_VERSION})"]
 
     log_text = ft.Text(
@@ -111,6 +122,22 @@ def main(page: ft.Page):
         log_text.value = "\n".join(log_lines)
         page.update()
 
+    def close_session(quiet: bool = False):
+        sock = state["sock"]
+        state["sock"] = None
+        state["target"] = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+            if not quiet:
+                append_log("Disconnected TCP session.")
+
     host_field = ft.TextField(label="PC / LIS IP", value="172.16.106.181", expand=2, dense=True)
     port_field = ft.TextField(label="Port", value="7010", keyboard_type=ft.KeyboardType.NUMBER, expand=1, dense=True)
 
@@ -125,9 +152,11 @@ def main(page: ft.Page):
         dense=True,
     )
 
+    keep_alive_cb = ft.Checkbox(label="Keep TCP session open between pushes (recommended for Chiron)", value=True)
+
     payload_field = ft.TextField(
         label="Message Payload",
-        value=ASTM_PRESET,
+        value=make_astm_preset(),
         multiline=True,
         min_lines=7,
         max_lines=11,
@@ -136,12 +165,12 @@ def main(page: ft.Page):
 
     def load_astm(_):
         protocol_dd.value = "ASTM"
-        payload_field.value = ASTM_PRESET
+        payload_field.value = make_astm_preset()
         page.update()
 
     def load_hl7(_):
         protocol_dd.value = "HL7"
-        payload_field.value = HL7_PRESET
+        payload_field.value = make_hl7_preset()
         page.update()
 
     send_btn = ft.FilledButton(
@@ -149,7 +178,60 @@ def main(page: ft.Page):
         icon=ft.Icons.SEND,
         style=ft.ButtonStyle(bgcolor="#0284c7", color="white"),
         height=46,
+        expand=True,
     )
+
+    disc_btn = ft.OutlinedButton(
+        "Disconnect",
+        icon=ft.Icons.LINK_OFF,
+        height=46,
+        on_click=lambda _: close_session(quiet=False),
+    )
+
+    def get_socket(host: str, port: int) -> socket.socket:
+        if state["sock"] is not None and state["target"] == (host, port):
+            return state["sock"]
+        close_session(quiet=True)
+        append_log(f"Connecting to {host}:{port}...")
+        s = socket.create_connection((host, port), timeout=8.0)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        s.settimeout(8.0)
+        state["sock"] = s
+        state["target"] = (host, port)
+        append_log("Connected.")
+        return s
+
+    def send_over_socket(sock: socket.socket, proto: str, payload: str):
+        if proto == "ASTM":
+            sock.sendall(ENQ)
+            append_log("TX -> <ENQ>")
+            resp = sock.recv(64)
+            append_log(f"RX <- {resp!r}")
+            if ACK not in resp:
+                raise RuntimeError("Expected ACK after ENQ")
+            for frame in build_astm_frames(payload):
+                sock.sendall(frame)
+                append_log(f"TX -> {frame!r}")
+                ack = sock.recv(64)
+                append_log(f"RX <- {ack!r}")
+                if ACK not in ack:
+                    raise RuntimeError("Frame rejected (NAK)")
+            sock.sendall(EOT)
+            append_log("TX -> <EOT> (Complete)")
+        elif proto == "HL7":
+            msg = build_hl7_frame(payload)
+            sock.sendall(msg)
+            append_log(f"TX -> MLLP ({len(msg)} bytes)")
+            try:
+                reply = sock.recv(4096)
+                append_log(f"RX <- {reply.decode('utf-8', errors='replace')!r}")
+            except socket.timeout:
+                append_log("RX <- (no HL7 ACK)")
+        else:
+            raw = payload.replace("\\r", "\r").replace("\\n", "\n").encode("utf-8")
+            sock.sendall(raw)
+            append_log(f"TX -> RAW ({len(raw)} bytes)")
 
     def on_send(_):
         host = (host_field.value or "").strip()
@@ -160,48 +242,26 @@ def main(page: ft.Page):
             return
         proto = protocol_dd.value or "ASTM"
         payload = payload_field.value or ""
+        persist = bool(keep_alive_cb.value)
 
         send_btn.disabled = True
         page.update()
 
         def worker():
-            append_log(f"Connecting to {host}:{port} [{proto}]...")
             try:
-                with socket.create_connection((host, port), timeout=5.0) as sock:
-                    sock.settimeout(5.0)
-                    if proto == "ASTM":
-                        sock.sendall(ENQ)
-                        append_log("TX -> <ENQ>")
-                        resp = sock.recv(64)
-                        append_log(f"RX <- {resp!r}")
-                        if ACK not in resp:
-                            append_log("ERROR: Expected ACK after ENQ")
-                            return
-                        for frame in build_astm_frames(payload):
-                            sock.sendall(frame)
-                            append_log(f"TX -> {frame!r}")
-                            ack = sock.recv(64)
-                            append_log(f"RX <- {ack!r}")
-                            if ACK not in ack:
-                                append_log("ERROR: Frame rejected (NAK)")
-                                return
-                        sock.sendall(EOT)
-                        append_log("TX -> <EOT> (Complete)")
-                    elif proto == "HL7":
-                        msg = build_hl7_frame(payload)
-                        sock.sendall(msg)
-                        append_log(f"TX -> MLLP ({len(msg)} bytes)")
-                        try:
-                            reply = sock.recv(4096)
-                            append_log(f"RX <- {reply.decode('utf-8', errors='replace')!r}")
-                        except socket.timeout:
-                            append_log("RX <- (no HL7 ACK)")
-                    else:
-                        raw = payload.replace("\\r", "\r").replace("\\n", "\n").encode("utf-8")
-                        sock.sendall(raw)
-                        append_log(f"TX -> RAW ({len(raw)} bytes)")
+                sock = get_socket(host, port)
+                try:
+                    send_over_socket(sock, proto, payload)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    append_log("Session reset by host, reconnecting...")
+                    close_session(quiet=True)
+                    sock = get_socket(host, port)
+                    send_over_socket(sock, proto, payload)
+                if not persist:
+                    close_session(quiet=True)
             except Exception as exc:
                 append_log(f"ERROR: {exc}")
+                close_session(quiet=True)
             finally:
                 send_btn.disabled = False
                 page.update()
@@ -210,35 +270,34 @@ def main(page: ft.Page):
 
     send_btn.on_click = on_send
 
-    # Update Dialog
     def show_update_dialog(release: dict):
         async def open_apk_download(_):
-         await page.launch_url(release["apk_url"])
+            await page.launch_url(release["apk_url"])
 
         dlg = ft.AlertDialog(
-        modal=True,
-        title=ft.Text(f"Update Available ({release['version']})"),
-        content=ft.Column(
-            [
-                ft.Text(f"Installed: v{APP_VERSION} -> Latest: {release['version']}", weight=ft.FontWeight.BOLD),
-                ft.Container(
-                    content=ft.Text(release["changelog"], size=12),
-                    bgcolor="#020617",
-                    padding=10,
-                    border_radius=8,
-                ),
+            modal=True,
+            title=ft.Text(f"Update Available ({release['version']})"),
+            content=ft.Column(
+                [
+                    ft.Text(f"Installed: v{APP_VERSION} -> Latest: {release['version']}", weight=ft.FontWeight.BOLD),
+                    ft.Container(
+                        content=ft.Text(release["changelog"], size=12),
+                        bgcolor="#020617",
+                        padding=10,
+                        border_radius=8,
+                    ),
+                ],
+                tight=True,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+            actions=[
+                ft.FilledButton(
+                    "Download & Install APK",
+                    icon=ft.Icons.DOWNLOAD,
+                    on_click=open_apk_download,
+                )
             ],
-            tight=True,
-            scroll=ft.ScrollMode.AUTO,
-        ),
-        actions=[
-            ft.FilledButton(
-                "Download & Install APK",
-                icon=ft.Icons.DOWNLOAD,
-                on_click=open_apk_download,
-            )
-        ],
-    )
+        )
         page.show_dialog(dlg)
 
     def check_updates_bg():
@@ -256,6 +315,7 @@ def main(page: ft.Page):
                     ft.Text(f"Chiron LIS Simulator (v{APP_VERSION})", size=18, weight=ft.FontWeight.BOLD, color="#38bdf8"),
                     ft.Row([host_field, port_field]),
                     protocol_dd,
+                    keep_alive_cb,
                     ft.Row(
                         [
                             ft.OutlinedButton("ASTM Preset", on_click=load_astm, expand=True),
@@ -263,7 +323,7 @@ def main(page: ft.Page):
                         ]
                     ),
                     payload_field,
-                    send_btn,
+                    ft.Row([send_btn, disc_btn]),
                 ],
                 spacing=10,
             ),
