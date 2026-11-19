@@ -212,34 +212,34 @@ def main(page: ft.Page):
 
     # Update Dialog
     def show_update_dialog(release: dict):
-        def open_apk_download(_):
-            page.launch_url(release["apk_url"])
+        async def open_apk_download(_):
+         await page.launch_url(release["apk_url"])
 
         dlg = ft.AlertDialog(
-            modal=True,
-            title=ft.Text(f"Update Available ({release['version']})"),
-            content=ft.Column(
-                [
-                    ft.Text(f"Installed: v{APP_VERSION} -> Latest: {release['version']}", weight=ft.FontWeight.BOLD),
-                    ft.Container(
-                        content=ft.Text(release["changelog"], size=12),
-                        bgcolor="#020617",
-                        padding=10,
-                        border_radius=8,
-                    ),
-                ],
-                tight=True,
-                scroll=ft.ScrollMode.AUTO,
-            ),
-            actions=[
-                ft.FilledButton(
-                    "Download & Install APK",
-                    icon=ft.Icons.DOWNLOAD,
-                    on_click=open_apk_download,
-                )
+        modal=True,
+        title=ft.Text(f"Update Available ({release['version']})"),
+        content=ft.Column(
+            [
+                ft.Text(f"Installed: v{APP_VERSION} -> Latest: {release['version']}", weight=ft.FontWeight.BOLD),
+                ft.Container(
+                    content=ft.Text(release["changelog"], size=12),
+                    bgcolor="#020617",
+                    padding=10,
+                    border_radius=8,
+                ),
             ],
-        )
-        page.open(dlg)
+            tight=True,
+            scroll=ft.ScrollMode.AUTO,
+        ),
+        actions=[
+            ft.FilledButton(
+                "Download & Install APK",
+                icon=ft.Icons.DOWNLOAD,
+                on_click=open_apk_download,
+            )
+        ],
+    )
+        page.show_dialog(dlg)
 
     def check_updates_bg():
         rel = check_github_release()
@@ -296,4 +296,4 @@ def main(page: ft.Page):
     threading.Thread(target=check_updates_bg, daemon=True).start()
 
 
-ft.app(main)
+ft.run(main)
