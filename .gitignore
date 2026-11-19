@@ -1,0 +1,7 @@
+build/
+dist/
+__pycache__/
+*.spec
+saved_samples/
+tube_memory.json
+.update_attempted
