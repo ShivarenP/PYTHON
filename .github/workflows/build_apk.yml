@@ -36,11 +36,12 @@ jobs:
         run: pip install "flet>=0.27.0"
 
       - name: Build Android APK
-        working-directory: mobile.apk
-        run: flet build apk --yes
-
-      - name: Rename APK
-        run: cp mobile.apk/build/apk/app-release.apk Chiron-LIS-Simulator.apk
+        run: |
+          APP_DIR=$(dirname "$(find . -maxdepth 3 -name "main.py" | head -n 1)")
+          echo "Building Flet APK inside: $APP_DIR"
+          cd "$APP_DIR"
+          flet build apk --yes
+          cp build/apk/app-release.apk "$GITHUB_WORKSPACE/Chiron-LIS-Simulator.apk"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
