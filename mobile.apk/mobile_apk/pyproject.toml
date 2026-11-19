@@ -1,0 +1,12 @@
+[project]
+name = "Chiron LIS Simulator"
+version = "1.1.0"
+description = "Mobile LIS / ASTM / HL7 TCP Simulator"
+dependencies = ["flet>=0.27.0"]
+
+[tool.flet]
+org = "com.shivaren.chiron"
+product = "Chiron LIS Simulator"
+
+[tool.flet.android]
+permissions = ["android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE"]
