@@ -272,7 +272,7 @@ def main(page: ft.Page):
 
     def show_update_dialog(release: dict):
         async def open_apk_download(_):
-            await page.launch_url(release["apk_url"])
+            await ft.UrlLauncher().launch_url(release["apk_url"])
 
         dlg = ft.AlertDialog(
             modal=True,
@@ -286,6 +286,7 @@ def main(page: ft.Page):
                         padding=10,
                         border_radius=8,
                     ),
+                    ft.Text(release["apk_url"], size=11, color="#38bdf8", selectable=True),
                 ],
                 tight=True,
                 scroll=ft.ScrollMode.AUTO,

@@ -33,7 +33,7 @@ BASE_DIR = (
 SAMPLES_DIR = BASE_DIR / "saved_samples"
 TUBE_MEMORY_FILE = BASE_DIR / "tube_memory.json"
 
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.6"
 GITHUB_REPO = "ShivarenP/chiron-lis-simulator"  # <-- Change this!
 
 COMMON_TUBES = [
