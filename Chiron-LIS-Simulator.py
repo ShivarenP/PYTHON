@@ -13,7 +13,6 @@ from tkinter import messagebox, scrolledtext, ttk
 import uuid
 import sys
 import subprocess
-import sys
 import urllib.request
 import os
 import random
@@ -35,8 +34,8 @@ BASE_DIR = (
 SAMPLES_DIR = BASE_DIR / "saved_samples"
 TUBE_MEMORY_FILE = BASE_DIR / "tube_memory.json"
 
-APP_VERSION = "1.1.0"
-GITHUB_REPO = "ShivarenP/PYTHON" 
+APP_VERSION = "1.1.1"
+GITHUB_REPO = "ShivarenP/PYTHON"
 
 COMMON_TUBES = [
     "EDTA1",
@@ -145,7 +144,7 @@ THEMES = {
         "driver": "#38bdf8",
     },
     "dark": {
-"bg": "#000000",
+        "bg": "#000000",
         "panel": "#111111",
         "fg": "#f4f4f5",
         "muted": "#a1a1aa",
@@ -182,6 +181,7 @@ def save_settings(data: dict) -> None:
         SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
+
 
 # =====================================================================
 # TUBE MEMORY & BARCODE RESOLUTION ENGINE
@@ -315,8 +315,10 @@ def wrap_astm_records(records: list[str]) -> list[bytes]:
         frames.append(f"\x02{body}{cs}\r\n".encode("ascii"))
     return frames
 
+
 def get_message_timestamp(age_hours: float = 0.0) -> str:
     return (datetime.now() - timedelta(hours=age_hours)).strftime("%Y%m%d%H%M%S")
+
 
 def build_astm_frames(
     source_uid: str,
@@ -460,6 +462,7 @@ class TcpClientSession:
                 pass
             self.sock = None
 
+
 # =====================================================================
 # PRE-FLIGHT TUBE ASSIGNMENT MODAL
 # =====================================================================
@@ -476,7 +479,6 @@ class TubeAssignmentDialog(tk.Toplevel):
         default_sample_id: str,
         results: list[tuple[str, str, str, str]],
         tube_memory: dict[str, str],
-        
     ):
         super().__init__(parent)
         self.title("Assign Tubes & Review Batch Barcodes")
@@ -545,8 +547,6 @@ class TubeAssignmentDialog(tk.Toplevel):
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -639,10 +639,6 @@ class TubeAssignmentDialog(tk.Toplevel):
         self.confirmed_results = selected
         self.destroy()
 
-
-# =====================================================================
-# DESKTOP GUI APPLICATION
-# =====================================================================
 
 # =====================================================================
 # FORCED AUTO-UPDATER & CHANGELOG DIALOG (GitHub Releases)
@@ -799,7 +795,7 @@ class ForcedUpdateDialog(tk.Toplevel):
                 ),
             )
 
-def _apply_and_restart(self, current_exe: Path, staged_exe: Path) -> None:
+    def _apply_and_restart(self, current_exe: Path, staged_exe: Path) -> None:
         bat_path = current_exe.with_name("_chiron_sim_update.bat")
         bat_script = f"""@echo off
 set /a tries=0
@@ -830,6 +826,11 @@ del "%~f0"
             close_fds=True,
         )
         os._exit(0)
+
+
+# =====================================================================
+# DESKTOP GUI APPLICATION
+# =====================================================================
 
 class LisSimulatorGUI(tk.Tk):
     def __init__(self):
@@ -865,10 +866,10 @@ class LisSimulatorGUI(tk.Tk):
     # ---------------- THEME ENGINE ----------------
 
     def _toggle_theme(self) -> None:
-     self.dark_mode = not self.dark_mode
-     self.settings["dark_mode"] = self.dark_mode
-     save_settings(self.settings)
-     self._apply_theme()
+        self.dark_mode = not self.dark_mode
+        self.settings["dark_mode"] = self.dark_mode
+        save_settings(self.settings)
+        self._apply_theme()
 
     def _apply_theme(self) -> None:
         t = THEMES["dark" if self.dark_mode else "light"]
@@ -932,7 +933,6 @@ class LisSimulatorGUI(tk.Tk):
         guard_file = BASE_DIR / ".update_attempted"
         if guard_file.exists():
             try:
-                # If an update ran less than 30 seconds ago, skip checking to prevent infinite loops
                 if time.time() - guard_file.stat().st_mtime < 30:
                     return
                 guard_file.unlink(missing_ok=True)
@@ -1135,6 +1135,7 @@ class LisSimulatorGUI(tk.Tk):
         log_btns = ttk.Frame(log_frame)
         log_btns.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(log_btns, text="Clear Log", command=self._clear_log).pack(side=tk.RIGHT)
+        ttk.Button(log_btns, text="Copy Log", command=self._copy_log).pack(side=tk.RIGHT, padx=(0, 6))
 
         self.theme_btn = ttk.Button(log_btns, text="Dark Mode", command=self._toggle_theme)
         self.theme_btn.pack(side=tk.RIGHT, padx=(0, 6))
@@ -1186,7 +1187,7 @@ class LisSimulatorGUI(tk.Tk):
         ]
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert("1.0", "\n".join(formatted_lines) + "\n")
-        self._log(f"[*] Formatted & cleaned {len(formatted_lines)} result row(s).")
+        self.log(f"[*] Formatted & cleaned {len(formatted_lines)} result row(s).")
         self._update_result_count()
 
     def _update_result_count(self) -> None:
@@ -1285,22 +1286,14 @@ class LisSimulatorGUI(tk.Tk):
         self._refresh_sample_list()
         self.log(f"[✓] Saved sample -> {fpath.name}")
 
-    def _new_sample(self):
-        # 1. Deselect any saved sample in the left sidebar
-            self.sample_listbox.selection_clear(0, tk.END)
+    def _new_sample(self) -> None:
+        self.sample_listbox.selection_clear(0, tk.END)
+        self.sample_var.set("")
+        self.results_text.delete("1.0", tk.END)
+        self.log("[*] Ready for new sample entry.")
+        self._update_result_count()
 
-        # 2. Clear the Default Barcode field (or put a placeholder/blank)
-            self.sample_var.set("")
-
-        # 3. Clear the Results text box
-            self.results_text.delete("1.0", tk.END)
-
-        # 4. Optional: log it to the Live Wire Log if you have a log helper
-            self._log("[*] Ready for new sample entry.")
-            self._update_result_count()
-
-    def _generate_results(self):
-        # Look up which protocol ID ("1".."4") is currently selected
+    def _generate_results(self) -> None:
         proto_label = self.proto_var.get()
         proto_id = PROTOCOL_BY_LABEL.get(proto_label, "1")
         panel = SAMPLE_PANELS.get(proto_id, SAMPLE_PANELS["1"])
@@ -1309,7 +1302,6 @@ class LisSimulatorGUI(tk.Tk):
         abnormal_count = 0
 
         for code, low, high, decimals, unit in panel:
-            # 25% chance to throw in an abnormal Low or High value
             if random.random() < 0.25:
                 abnormal_count += 1
                 if random.choice(["low", "high"]) == "low":
@@ -1324,7 +1316,7 @@ class LisSimulatorGUI(tk.Tk):
 
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert("1.0", "\n".join(lines) + "\n")
-        self._log(f"[*] Generated {len(lines)} results ({abnormal_count} abnormal) for {proto_label}.")
+        self.log(f"[*] Generated {len(lines)} results ({abnormal_count} abnormal) for {proto_label}.")
         self._update_result_count()
 
     def _copy_hercules(self) -> None:
@@ -1688,8 +1680,6 @@ class LisSimulatorGUI(tk.Tk):
 
         self.log(f"[✓] All {total_tubes} tube batch(es) completed!")
 
-    # ---------------- LOGGING & CLEANUP ----------------
-
     # ---------------- LOGGING & CHIRON WATCHER ----------------
 
     def log(self, msg: str) -> None:
@@ -1749,7 +1739,6 @@ class LisSimulatorGUI(tk.Tk):
             while True:
                 line = f.readline()
                 if not line:
-                    # Check if Chiron was restarted and created a newer GUID*console.log
                     newest = self._get_latest_chiron_log()
                     if newest and newest != current_path:
                         f.close()
@@ -1780,6 +1769,13 @@ class LisSimulatorGUI(tk.Tk):
         self.log_box.delete("1.0", tk.END)
         self.log_box.configure(state=tk.DISABLED)
 
+    def _copy_log(self) -> None:
+        content = self.log_box.get("1.0", tk.END).strip()
+        if content:
+            self.clipboard_clear()
+            self.clipboard_append(content)
+            self.log("[✓] Live Wire Log copied to clipboard.")
+
     def _on_close(self) -> None:
         self._disconnect_transport(silent=True)
         self.destroy()
@@ -1788,5 +1784,3 @@ class LisSimulatorGUI(tk.Tk):
 if __name__ == "__main__":
     app = LisSimulatorGUI()
     app.mainloop()
-
-    
