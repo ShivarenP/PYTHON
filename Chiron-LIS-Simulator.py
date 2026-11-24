@@ -35,7 +35,7 @@ BASE_DIR = (
 SAMPLES_DIR = BASE_DIR / "saved_samples"
 TUBE_MEMORY_FILE = BASE_DIR / "tube_memory.json"
 
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "ShivarenP/PYTHON" 
 
 COMMON_TUBES = [
@@ -145,25 +145,43 @@ THEMES = {
         "driver": "#38bdf8",
     },
     "dark": {
-        "bg": "#111827",
-        "panel": "#1f2937",
-        "fg": "#f3f4f6",
-        "muted": "#9ca3af",
+"bg": "#000000",
+        "panel": "#111111",
+        "fg": "#f4f4f5",
+        "muted": "#a1a1aa",
         "accent": "#3b82f6",
         "accent_hover": "#2563eb",
-        "input_bg": "#0f172a",
-        "input_fg": "#f8fafc",
-        "border": "#374151",
-        "select_bg": "#1d4ed8",
+        "input_bg": "#18181b",
+        "input_fg": "#f4f4f5",
+        "border": "#27272a",
+        "select_bg": "#27272a",
         "select_fg": "#ffffff",
-        "log_bg": "#090d16",
-        "log_fg": "#e2e8f0",
+        "log_bg": "#050505",
+        "log_fg": "#e4e4e7",
         "err": "#f87171",
         "ok": "#4ade80",
         "warn": "#facc15",
         "driver": "#38bdf8",
     },
 }
+
+SETTINGS_FILE = TUBE_MEMORY_FILE.with_name("settings.json")
+
+
+def load_settings() -> dict:
+    try:
+        if SETTINGS_FILE.exists():
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_settings(data: dict) -> None:
+    try:
+        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # =====================================================================
 # TUBE MEMORY & BARCODE RESOLUTION ENGINE
@@ -832,7 +850,8 @@ class LisSimulatorGUI(tk.Tk):
         self.push_counter: dict[str, int] = {}
         self.saved_files: list[Path] = []
 
-        self.dark_mode = False
+        self.settings = load_settings()
+        self.dark_mode = bool(self.settings.get("dark_mode", False))
 
         self._build_ui()
         self._apply_theme()
@@ -846,8 +865,10 @@ class LisSimulatorGUI(tk.Tk):
     # ---------------- THEME ENGINE ----------------
 
     def _toggle_theme(self) -> None:
-        self.dark_mode = not self.dark_mode
-        self._apply_theme()
+     self.dark_mode = not self.dark_mode
+     self.settings["dark_mode"] = self.dark_mode
+     save_settings(self.settings)
+     self._apply_theme()
 
     def _apply_theme(self) -> None:
         t = THEMES["dark" if self.dark_mode else "light"]
