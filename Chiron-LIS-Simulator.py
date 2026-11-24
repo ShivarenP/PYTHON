@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import queue
@@ -16,6 +16,8 @@ import subprocess
 import sys
 import urllib.request
 import os
+import random
+import glob
 
 try:
     import serial
@@ -33,8 +35,8 @@ BASE_DIR = (
 SAMPLES_DIR = BASE_DIR / "saved_samples"
 TUBE_MEMORY_FILE = BASE_DIR / "tube_memory.json"
 
-APP_VERSION = "1.0.6"
-GITHUB_REPO = "ShivarenP/chiron-lis-simulator"  # <-- Change this!
+APP_VERSION = "1.0.7"
+GITHUB_REPO = "ShivarenP/PYTHON" 
 
 COMMON_TUBES = [
     "EDTA1",
@@ -89,6 +91,79 @@ ACK = b"\x06"
 NAK = b"\x15"
 EOT = b"\x04"
 
+SAMPLE_PANELS = {
+    "1": [  # ASTM (Standard E1381/E1394) - Hematology / General
+        ("WBC", 4.0, 11.0, 1, "10^9/L"),
+        ("RBC", 4.2, 5.8, 2, "10^12/L"),
+        ("HGB", 12.0, 17.5, 1, "g/dL"),
+        ("HCT", 36.0, 52.0, 1, "%"),
+        ("PLT", 150, 400, 0, "10^9/L"),
+    ],
+    "2": [  # HL7 (v2.x MLLP) - Basic Metabolic / Chemistry
+        ("GLU", 3.9, 6.1, 1, "mmol/L"),
+        ("NA", 135, 145, 0, "mmol/L"),
+        ("K", 3.5, 5.1, 1, "mmol/L"),
+        ("UREA", 2.5, 7.1, 1, "mmol/L"),
+        ("CREAT", 60, 110, 0, "umol/L"),
+    ],
+    "3": [  # Beckman AU Native ASCII - Liver / Lipid Chemistry
+        ("ALT", 7, 55, 0, "U/L"),
+        ("AST", 8, 48, 0, "U/L"),
+        ("ALP", 40, 129, 0, "U/L"),
+        ("CHOL", 3.0, 5.2, 2, "mmol/L"),
+        ("TRIG", 0.5, 1.7, 2, "mmol/L"),
+    ],
+    "4": [  # Cobas e411 (Elecsys ASTM) - Immunoassay
+        ("TSH", 0.40, 4.20, 2, "uIU/mL"),
+        ("FT4", 12.0, 22.0, 1, "pmol/L"),
+        ("FERR", 30, 300, 0, "ng/mL"),
+        ("VITD", 50.0, 125.0, 1, "nmol/L"),
+        ("HBA1C", 4.5, 6.4, 1, "%"),
+    ],
+}
+
+CHIRON_DIR = r"C:\chiron\Chiron.Instrument.BeckmanDxH500"
+
+THEMES = {
+    "light": {
+        "bg": "#f3f4f6",
+        "panel": "#ffffff",
+        "fg": "#111827",
+        "muted": "#4b5563",
+        "accent": "#2563eb",
+        "accent_hover": "#1d4ed8",
+        "input_bg": "#ffffff",
+        "input_fg": "#111827",
+        "border": "#d1d5db",
+        "select_bg": "#dbeafe",
+        "select_fg": "#1e3a8a",
+        "log_bg": "#111827",      # Keep Live Wire Log dark terminal style even in light mode
+        "log_fg": "#e5e7eb",
+        "err": "#f87171",
+        "ok": "#4ade80",
+        "warn": "#facc15",
+        "driver": "#38bdf8",
+    },
+    "dark": {
+        "bg": "#111827",
+        "panel": "#1f2937",
+        "fg": "#f3f4f6",
+        "muted": "#9ca3af",
+        "accent": "#3b82f6",
+        "accent_hover": "#2563eb",
+        "input_bg": "#0f172a",
+        "input_fg": "#f8fafc",
+        "border": "#374151",
+        "select_bg": "#1d4ed8",
+        "select_fg": "#ffffff",
+        "log_bg": "#090d16",
+        "log_fg": "#e2e8f0",
+        "err": "#f87171",
+        "ok": "#4ade80",
+        "warn": "#facc15",
+        "driver": "#38bdf8",
+    },
+}
 
 # =====================================================================
 # TUBE MEMORY & BARCODE RESOLUTION ENGINE
@@ -222,11 +297,17 @@ def wrap_astm_records(records: list[str]) -> list[bytes]:
         frames.append(f"\x02{body}{cs}\r\n".encode("ascii"))
     return frames
 
+def get_message_timestamp(age_hours: float = 0.0) -> str:
+    return (datetime.now() - timedelta(hours=age_hours)).strftime("%Y%m%d%H%M%S")
 
-def build_single_astm_frames(
-    source_uid: str, barcode: str, items: list[tuple[str, str, str]], use_carets: bool = False
+def build_astm_frames(
+    source_uid: str,
+    barcode: str,
+    items: list[tuple[str, str, str]],
+    use_carets: bool = False,
+    ts: str | None = None,
 ) -> list[bytes]:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    ts = ts or datetime.now().strftime("%Y%m%d%H%M%S")
     prefix = "^^^" if use_carets else ""
     test_ids = "\\".join(f"{prefix}{c}" for c, _, _ in items)
     records = [
@@ -241,43 +322,42 @@ def build_single_astm_frames(
 
 
 def build_single_cobas_frames(
-    source_uid: str, barcode: str, items: list[tuple[str, str, str]]
+    source_uid: str, barcode: str, items: list[tuple[str, str, str]], ts: str | None = None
 ) -> list[bytes]:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    test_ids = "\\".join(f"^^^{c}/1" for c, _, _ in items)
+    ts = ts or datetime.now().strftime("%Y%m%d%H%M%S")
     records = [
-        rf"H|\^&|||{source_uid}^Elecsys||||||RSUPL^REAL|P|1|{ts}",
-        "P|1",
-        f"O|1|{barcode}|0^0^1^^SAMPLE^SC|{test_ids}|||||||SAMPLE||||SAMPLE||||||||||F",
+        rf"H|\^&|||{source_uid}|||||||P||",
+        "P|1||||||||||||||",
+        f"O|1|{barcode}|1^0^1^^SAMPLE^NORMAL|ALL|R|{ts}|||||X||||||||||||||",
     ]
     for res_seq, (code, val, unit) in enumerate(items, start=1):
-        records.append(f"R|{res_seq}|^^^{code}/1|{val}|{unit}||N||F||ADMIN||{ts}")
-    records.append("L|1|N")
+        clean_code = code.lstrip("^")
+        records.append(f"R|{res_seq}|^^^{clean_code}^^0|{val}|{unit}||N||F|||{ts}|{ts}")
+    records.append("L|1|")
     return wrap_astm_records(records)
 
 
-def build_single_hl7_message(
-    source_uid: str, barcode: str, items: list[tuple[str, str, str]]
+def build_hl7(
+    source_uid: str,
+    barcode: str,
+    items: list[tuple[str, str, str]],
+    ts: str | None = None,
 ) -> bytes:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    ctrl_id = uuid.uuid4().hex[:10].upper()
+    ts = ts or datetime.now().strftime("%Y%m%d%H%M%S")
     segments = [
-        rf"MSH|^~\&|{source_uid}|LAB|CHIRON|LIS|{ts}||ORU^R01|{ctrl_id}|P|2.5",
+        f"MSH|^~\\&|{source_uid}|LAB|CHIRON|LIS|{ts}||ORU^R01|{barcode}|P|2.5",
         "PID|1",
-        f"ORC|RE|{barcode}",
-        f"OBR|1|{barcode}||{source_uid}^PANEL|||{ts}",
+        f"OBR|1|{barcode}|{barcode}|PANEL|||{ts}",
     ]
-    for res_seq, (code, val, unit) in enumerate(items, start=1):
-        try:
-            float(val)
-            vtype = "NM"
-        except ValueError:
-            vtype = "ST"
-        segments.append(f"OBX|{res_seq}|{vtype}|{code}^{code}||{val}|{unit}|||||F|||{ts}")
-    return b"\x0b" + ("\r".join(segments) + "\r").encode("ascii") + b"\x1c\r"
+    for idx, (code, val, unit) in enumerate(items, start=1):
+        segments.append(f"OBX|{idx}|NM|{code}||{val}|{unit}|||||F|||{ts}")
+    body = "\r".join(segments) + "\r"
+    return b"\x0b" + body.encode("ascii", errors="replace") + b"\x1c\r"
 
 
-def build_single_beckman_frame(barcode: str, items: list[tuple[str, str, str]]) -> bytes:
+def build_single_beckman_frame(
+    barcode: str, items: list[tuple[str, str, str]], ts: str | None = None
+) -> bytes:
     padded_sample = f"{barcode:<26}"[:26]
     demographics_pad = " " * 126
     blocks = [f"{c:>3}"[:3] + f"{v:>6}"[:6] + " " for c, v, _ in items]
@@ -286,19 +366,24 @@ def build_single_beckman_frame(barcode: str, items: list[tuple[str, str, str]]) 
 
 
 def build_payload(
-    proto: str, source_uid: str, default_sample_id: str, results: list[tuple[str, str, str, str]], use_carets: bool
+    proto: str,
+    source_uid: str,
+    default_sample_id: str,
+    results: list[tuple[str, str, str, str]],
+    use_carets: bool,
+    ts: str | None = None,
 ) -> list[tuple[str, list[bytes] | bytes]]:
     """Returns a list of (barcode, payload) batches so every barcode is sent as Orders[0]."""
     batches: list[tuple[str, list[bytes] | bytes]] = []
     for barcode, items in group_by_barcode(default_sample_id, results):
         if proto == "1":
-            batches.append((barcode, build_single_astm_frames(source_uid, barcode, items, use_carets)))
+            batches.append((barcode, build_astm_frames(source_uid, barcode, items, use_carets, ts=ts)))
         elif proto == "2":
-            batches.append((barcode, build_single_hl7_message(source_uid, barcode, items)))
+            batches.append((barcode, build_hl7(source_uid, barcode, items, ts=ts)))
         elif proto == "3":
-            batches.append((barcode, build_single_beckman_frame(barcode, items)))
+            batches.append((barcode, build_single_beckman_frame(barcode, items, ts=ts)))
         else:
-            batches.append((barcode, build_single_cobas_frames(source_uid, barcode, items)))
+            batches.append((barcode, build_single_cobas_frames(source_uid, barcode, items, ts=ts)))
     return batches
 
 
@@ -318,19 +403,22 @@ class TcpClientSession:
         log_fn(f"[*] Connecting TCP Client -> {self.host}:{self.port}...")
         self.sock = socket.create_connection((self.host, self.port), timeout=5.0)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-        self.sock.settimeout(3.0)
-        time.sleep(0.3)
+        self.sock.settimeout(15.0)
+        time.sleep(0.25)
 
     def reconnect(self, log_fn) -> None:
         self.close()
-        time.sleep(1.5)
+        time.sleep(1.0)
         self.open(log_fn)
 
     def send(self, data: bytes) -> None:
+        if self.sock is None:
+            raise OSError("Socket is closed")
         self.sock.sendall(data)
 
     def recv(self, size: int = 1) -> bytes:
+        if self.sock is None:
+            return b""
         try:
             data = self.sock.recv(size)
             if data == b"":
@@ -338,15 +426,21 @@ class TcpClientSession:
             return data
         except socket.timeout:
             return b""
+        except OSError:
+            self.close()
+            return b""
 
     def close(self) -> None:
         if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self.sock.close()
             except OSError:
                 pass
             self.sock = None
-
 
 # =====================================================================
 # PRE-FLIGHT TUBE ASSIGNMENT MODAL
@@ -364,6 +458,7 @@ class TubeAssignmentDialog(tk.Toplevel):
         default_sample_id: str,
         results: list[tuple[str, str, str, str]],
         tube_memory: dict[str, str],
+        
     ):
         super().__init__(parent)
         self.title("Assign Tubes & Review Batch Barcodes")
@@ -371,6 +466,9 @@ class TubeAssignmentDialog(tk.Toplevel):
         self.minsize(660, 380)
         self.transient(parent)
         self.grab_set()
+
+        self.theme = THEMES["dark" if getattr(parent, "dark_mode", False) else "light"]
+        self.configure(bg=self.theme["bg"])
 
         self.default_sample_id = default_sample_id.strip()
         self.base_req, self.default_tube = split_base_and_tube(self.default_sample_id)
@@ -418,18 +516,28 @@ class TubeAssignmentDialog(tk.Toplevel):
         ttk.Label(header, text="Tube / Barcode", width=18, font=("Segoe UI", 9, "bold")).grid(row=0, column=4, sticky="w")
         ttk.Label(header, text="Resolved Barcode", width=24, font=("Segoe UI", 9, "bold")).grid(row=0, column=5, sticky="w")
 
-        canvas = tk.Canvas(container, highlightthickness=0)
+        canvas = tk.Canvas(container, bg=self.theme["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
         scroll_inner = ttk.Frame(canvas)
 
         scroll_inner.bind(
             "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-        canvas.create_window((0, 0), window=scroll_inner, anchor="nw")
+        win_id = canvas.create_window((0, 0), window=scroll_inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_mousewheel(event: tk.Event) -> None:
+            if canvas.winfo_exists():
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self.bind("<Destroy>", lambda _e: canvas.unbind_all("<MouseWheel>"), add="+")
 
         for idx, (code, val, unit, explicit_ov) in enumerate(results):
             include_var = tk.BooleanVar(value=True)
@@ -712,11 +820,80 @@ class LisSimulatorGUI(tk.Tk):
         self.push_counter: dict[str, int] = {}
         self.saved_files: list[Path] = []
 
+        self.dark_mode = False
+
         self._build_ui()
+        self._apply_theme()
         self._refresh_sample_list()
         self.after(100, self._drain_log_queue)
+        self._start_chiron_log_watcher()
         self.after(500, self._check_forced_update_async)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._update_result_count()
+
+    # ---------------- THEME ENGINE ----------------
+
+    def _toggle_theme(self) -> None:
+        self.dark_mode = not self.dark_mode
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        t = THEMES["dark" if self.dark_mode else "light"]
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.configure(text="Light Mode" if self.dark_mode else "Dark Mode")
+
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        # Root window & PanedWindow
+        self.configure(bg=t["bg"])
+        style.configure("TPanedwindow", background=t["bg"])
+
+        # ttk Frames & LabelFrames
+        style.configure("TFrame", background=t["bg"])
+        style.configure("TLabelframe", background=t["bg"], bordercolor=t["border"], relief="groove")
+        style.configure("TLabelframe.Label", background=t["bg"], foreground=t["fg"], font=("Segoe UI", 9, "bold"))
+
+        # ttk Labels & Checkbuttons
+        style.configure("TLabel", background=t["bg"], foreground=t["fg"])
+        style.configure("TCheckbutton", background=t["bg"], foreground=t["fg"])
+        style.map("TCheckbutton", background=[("active", t["bg"])])
+
+        # ttk Buttons
+        style.configure("TButton", background=t["panel"], foreground=t["fg"], bordercolor=t["border"], padding=(8, 4))
+        style.map("TButton", background=[("active", t["select_bg"])], foreground=[("active", t["select_fg"])])
+
+        # ttk Entry & Combobox
+        style.configure("TEntry", fieldbackground=t["input_bg"], foreground=t["input_fg"], bordercolor=t["border"], insertcolor=t["input_fg"])
+        style.configure("TCombobox", fieldbackground=t["input_bg"], background=t["panel"], foreground=t["input_fg"], arrowcolor=t["fg"], bordercolor=t["border"])
+        style.map("TCombobox", fieldbackground=[("readonly", t["input_bg"])], foreground=[("readonly", t["input_fg"])])
+
+        # Classic tk widgets (Listbox, Results box, Live Wire Log)
+        self.sample_listbox.configure(
+            bg=t["input_bg"],
+            fg=t["input_fg"],
+            selectbackground=t["select_bg"],
+            selectforeground=t["select_fg"],
+            highlightbackground=t["border"],
+        )
+        self.results_text.configure(
+            bg=t["input_bg"],
+            fg=t["input_fg"],
+            insertbackground=t["input_fg"],
+            selectbackground=t["select_bg"],
+            selectforeground=t["select_fg"],
+            highlightbackground=t["border"],
+        )
+        self.log_box.configure(
+            bg=t["log_bg"],
+            fg=t["log_fg"],
+            insertbackground=t["log_fg"],
+            highlightbackground=t["border"],
+        )
+        self.log_box.tag_config("error", foreground=t["err"])
+        self.log_box.tag_config("success", foreground=t["ok"])
+        self.log_box.tag_config("warn", foreground=t["warn"])
+        self.log_box.tag_config("driver", foreground=t["driver"])
 
     def _check_forced_update_async(self) -> None:
         guard_file = BASE_DIR / ".update_attempted"
@@ -750,91 +927,116 @@ class LisSimulatorGUI(tk.Tk):
 
         # ---------------- LEFT SIDEBAR: SAVED SAMPLES ----------------
         left_frame = ttk.LabelFrame(main_pane, text="Saved Samples (saved_samples/)", padding=8)
-        main_pane.add(left_frame, weight=1)
+        main_pane.add(left_frame, weight=0)
 
-        self.sample_listbox = tk.Listbox(left_frame, font=("Consolas", 9), activestyle="none")
+        self.sample_listbox = tk.Listbox(left_frame, width=30, font=("Consolas", 9), activestyle="none")
         self.sample_listbox.pack(fill=tk.BOTH, expand=True)
         self.sample_listbox.bind("<<ListboxSelect>>", self._on_select_saved)
 
         sb_btns = ttk.Frame(left_frame)
         sb_btns.pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(sb_btns, text="Refresh", command=self._refresh_sample_list).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
-        ttk.Button(sb_btns, text="Delete", command=self._delete_selected_sample).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
+        ttk.Button(sb_btns, text="Refresh", command=self._refresh_sample_list).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Button(sb_btns, text="Delete", command=self._delete_selected_sample).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
+        )
 
         # ---------------- RIGHT WORKSPACE ----------------
         right_frame = ttk.Frame(main_pane)
-        main_pane.add(right_frame, weight=3)
+        main_pane.add(right_frame, weight=1)
 
-        # 1. Protocol & Sample Metadata
+        # 1. Protocol & Sample Metadata (Responsive 3-row layout)
         meta_frame = ttk.LabelFrame(right_frame, text="1. Analyzer & Default Barcode Configuration", padding=8)
         meta_frame.pack(fill=tk.X, pady=(0, 6))
+        meta_frame.columnconfigure(1, weight=2)
+        meta_frame.columnconfigure(3, weight=1)
 
         ttk.Label(meta_frame, text="Protocol:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.proto_var = tk.StringVar(value=PROTOCOLS["4"])
         self.proto_combo = ttk.Combobox(
-            meta_frame, textvariable=self.proto_var, values=list(PROTOCOLS.values()), state="readonly", width=28
+            meta_frame, textvariable=self.proto_var, values=list(PROTOCOLS.values()), state="readonly", width=24
         )
-        self.proto_combo.grid(row=0, column=1, sticky="w", padx=(0, 12))
+        self.proto_combo.grid(row=0, column=1, sticky="ew", padx=(0, 12))
         self.proto_combo.bind("<<ComboboxSelected>>", self._on_proto_changed)
 
         ttk.Label(meta_frame, text="Source UID:").grid(row=0, column=2, sticky="w", padx=(0, 4))
         self.uid_var = tk.StringVar(value="Cobas411")
-        ttk.Entry(meta_frame, textvariable=self.uid_var, width=16).grid(row=0, column=3, sticky="w", padx=(0, 12))
+        ttk.Entry(meta_frame, textvariable=self.uid_var, width=14).grid(row=0, column=3, sticky="ew")
 
-        ttk.Label(meta_frame, text="Default Barcode:").grid(row=0, column=4, sticky="w", padx=(0, 4))
+        ttk.Label(meta_frame, text="Default Barcode:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
         self.sample_var = tk.StringVar(value="85308824-EDTA1")
-        ttk.Entry(meta_frame, textvariable=self.sample_var, width=20).grid(row=0, column=5, sticky="w")
+        ttk.Entry(meta_frame, textvariable=self.sample_var, width=20).grid(
+            row=1, column=1, sticky="ew", padx=(0, 12), pady=(6, 0)
+        )
+
+        ttk.Label(meta_frame, text="Non-numeric:").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(6, 0))
+        self.non_num_var = tk.StringVar(value="skip")
+        ttk.Combobox(
+            meta_frame, textvariable=self.non_num_var, values=["skip", "dashes", "keep"], state="readonly", width=8
+        ).grid(row=1, column=3, sticky="w", pady=(6, 0))
 
         opts_row = ttk.Frame(meta_frame)
-        opts_row.grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        opts_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         self.carets_var = tk.BooleanVar(value=True)
         self.carets_chk = ttk.Checkbutton(opts_row, text="Prefix test codes with '^^^'", variable=self.carets_var)
         self.carets_chk.pack(side=tk.LEFT, padx=(0, 14))
 
         self.dedup_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            opts_row, text="Auto Dedup-Bypass", variable=self.dedup_var
-        ).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(opts_row, text="Auto Dedup-Bypass", variable=self.dedup_var).pack(side=tk.LEFT, padx=(0, 14))
 
         self.ask_tubes_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            opts_row, text="Assign Tubes pop-up before Push", variable=self.ask_tubes_var
-        ).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(opts_row, text="Assign Tubes pop-up before Push", variable=self.ask_tubes_var).pack(side=tk.LEFT)
 
-        ttk.Label(opts_row, text="Non-numeric:").pack(side=tk.LEFT, padx=(0, 4))
-        self.non_num_var = tk.StringVar(value="skip")
-        ttk.Combobox(
-            opts_row, textvariable=self.non_num_var, values=["skip", "dashes", "keep"], state="readonly", width=7
-        ).pack(side=tk.LEFT)
+        ttk.Label(opts_row, text="Age (hrs ago):").pack(side=tk.LEFT, padx=(10, 4))
+        self.age_hours_var = tk.StringVar(value="0")
+        ttk.Entry(opts_row, textvariable=self.age_hours_var, width=6).pack(side=tk.LEFT)
 
         self._on_proto_changed()
 
         # 2. Results Input Area
-        res_frame = ttk.LabelFrame(
+        self.res_frame = ttk.LabelFrame(
             right_frame,
             text="2. Results (Smart Paste: Code | Value | Unit  OR  Lab Table)",
             padding=8,
         )
-        res_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        self.res_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
 
-        self.results_text = scrolledtext.ScrolledText(res_frame, height=10, font=("Consolas", 10))
+        self.results_text = scrolledtext.ScrolledText(self.res_frame, height=10, font=("Consolas", 10))
         self.results_text.pack(fill=tk.BOTH, expand=True)
         self.results_text.insert(
             "1.0",
             "RBC|12|10^12/L\nWBC|15.8|10^9/L\nHBA1C|23.1|%\nLDL|3.20|mmol/L\n",
         )
 
-        res_toolbar = ttk.Frame(res_frame)
+        def _on_results_modified(_event: tk.Event) -> None:
+            if self.results_text.edit_modified():
+                self._update_result_count()
+                self.results_text.edit_modified(False)
+
+        self.results_text.bind("<<Modified>>", _on_results_modified)
+        self.results_text.edit_modified(False)
+
+        res_toolbar = ttk.Frame(self.res_frame)
         res_toolbar.pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(res_toolbar, text="Format / Clean Table", command=self._clean_results_box).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(res_toolbar, text="Save Sample to Library", command=self._save_current_sample).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(res_toolbar, text="Format / Clean Table", command=self._clean_results_box).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(res_toolbar, text="New Sample", command=self._new_sample).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(res_toolbar, text="Generate Results", command=self._generate_results).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(res_toolbar, text="Save Sample to Library", command=self._save_current_sample).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
         ttk.Button(res_toolbar, text="Copy Hercules Frames", command=self._copy_hercules).pack(side=tk.LEFT)
 
-        # 3. Transport Settings & Push Controls
+        # 3. Transport Settings & Push Controls (Responsive 2-row layout)
         trans_frame = ttk.LabelFrame(right_frame, text="3. Transport & Transmit", padding=8)
         trans_frame.pack(fill=tk.X, pady=(0, 6))
+        trans_frame.columnconfigure(3, weight=1)
+        trans_frame.columnconfigure(5, weight=1)
 
+        # Row 0: Mode + TCP Settings
         self.transport_var = tk.StringVar(value="Serial COM")
         ttk.Label(trans_frame, text="Mode:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         t_combo = ttk.Combobox(
@@ -844,35 +1046,35 @@ class LisSimulatorGUI(tk.Tk):
             state="readonly",
             width=12,
         )
-        t_combo.grid(row=0, column=1, sticky="w", padx=(0, 10))
+        t_combo.grid(row=0, column=1, sticky="w", padx=(0, 12))
         t_combo.bind("<<ComboboxSelected>>", self._on_transport_changed)
 
         ttk.Label(trans_frame, text="Host / IP:").grid(row=0, column=2, sticky="w", padx=(0, 4))
         self.host_var = tk.StringVar(value="172.16.106.181")
         self.host_entry = ttk.Entry(trans_frame, textvariable=self.host_var, width=16)
-        self.host_entry.grid(row=0, column=3, sticky="w", padx=(0, 10))
+        self.host_entry.grid(row=0, column=3, sticky="ew", padx=(0, 12))
 
         ttk.Label(trans_frame, text="Port:").grid(row=0, column=4, sticky="w", padx=(0, 4))
         self.port_var = tk.StringVar(value="7010")
-        self.port_entry = ttk.Entry(trans_frame, textvariable=self.port_var, width=7)
-        self.port_entry.grid(row=0, column=5, sticky="w", padx=(0, 12))
+        self.port_entry = ttk.Entry(trans_frame, textvariable=self.port_var, width=8)
+        self.port_entry.grid(row=0, column=5, sticky="w")
 
-        ttk.Label(trans_frame, text="COM:").grid(row=0, column=6, sticky="w", padx=(0, 4))
+        # Row 1: Serial COM Settings + PUSH SAMPLE anchored right
+        ttk.Label(trans_frame, text="COM:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
         com_defaults = self._detect_com_ports()
         self.com_var = tk.StringVar(value="COM11" if "COM11" in com_defaults else com_defaults[0])
-        self.com_combo = ttk.Combobox(trans_frame, textvariable=self.com_var, values=com_defaults, width=9)
-        self.com_combo.grid(row=0, column=7, sticky="w", padx=(0, 8))
+        self.com_combo = ttk.Combobox(trans_frame, textvariable=self.com_var, values=com_defaults, width=10)
+        self.com_combo.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(6, 0))
 
-        ttk.Label(trans_frame, text="Baud:").grid(row=0, column=8, sticky="w", padx=(0, 4))
+        ttk.Label(trans_frame, text="Baud:").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(6, 0))
         self.baud_var = tk.StringVar(value="19200")
         self.baud_combo = ttk.Combobox(
-            trans_frame, textvariable=self.baud_var, values=["9600", "19200", "38400", "115200"], width=8
+            trans_frame, textvariable=self.baud_var, values=["9600", "19200", "38400", "115200"], width=9
         )
-        self.baud_combo.grid(row=0, column=9, sticky="w", padx=(0, 12))
+        self.baud_combo.grid(row=1, column=3, sticky="w", pady=(6, 0))
 
         self.push_btn = ttk.Button(trans_frame, text="PUSH SAMPLE", command=self._on_push_clicked)
-        self.push_btn.grid(row=0, column=10, sticky="e")
-        trans_frame.columnconfigure(10, weight=1)
+        self.push_btn.grid(row=1, column=4, columnspan=2, sticky="e", pady=(6, 0))
 
         self._on_transport_changed()
 
@@ -888,6 +1090,9 @@ class LisSimulatorGUI(tk.Tk):
         log_btns = ttk.Frame(log_frame)
         log_btns.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(log_btns, text="Clear Log", command=self._clear_log).pack(side=tk.RIGHT)
+
+        self.theme_btn = ttk.Button(log_btns, text="Dark Mode", command=self._toggle_theme)
+        self.theme_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
     # ---------------- UI EVENT HANDLERS ----------------
 
@@ -922,7 +1127,8 @@ class LisSimulatorGUI(tk.Tk):
             self.host_var.set("172.16.106.181")
 
     def _clean_results_box(self) -> None:
-        parsed = parse_results_block(self.results_text.get("1.0", tk.END), self.non_num_var.get())
+        raw = self.results_text.get("1.0", tk.END)
+        parsed = parse_results_block(raw, self.non_num_var.get())
         if not parsed:
             messagebox.showwarning("No Results", "No valid result rows found to format.")
             return
@@ -933,6 +1139,22 @@ class LisSimulatorGUI(tk.Tk):
         ]
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert("1.0", "\n".join(formatted_lines) + "\n")
+        self._log(f"[*] Formatted & cleaned {len(formatted_lines)} result row(s).")
+        self._update_result_count()
+
+    def _update_result_count(self) -> None:
+        if not hasattr(self, "res_frame"):
+            return
+        lines = [
+            ln.strip()
+            for ln in self.results_text.get("1.0", tk.END).splitlines()
+            if ln.strip()
+        ]
+        count = len(lines)
+        label = "1 row" if count == 1 else f"{count} rows"
+        self.res_frame.configure(
+            text=f"2. Results (Smart Paste: Code | Value | Unit  OR  Lab Table)  —  {label}"
+        )
 
     def _refresh_sample_list(self) -> None:
         self.sample_listbox.delete(0, tk.END)
@@ -973,6 +1195,7 @@ class LisSimulatorGUI(tk.Tk):
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert("1.0", "\n".join(lines) + "\n")
         self.log(f"[*] Loaded saved sample: {fpath.name}")
+        self._update_result_count()
 
     def _delete_selected_sample(self) -> None:
         sel = self.sample_listbox.curselection()
@@ -1014,6 +1237,48 @@ class LisSimulatorGUI(tk.Tk):
         fpath.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self._refresh_sample_list()
         self.log(f"[✓] Saved sample -> {fpath.name}")
+
+    def _new_sample(self):
+        # 1. Deselect any saved sample in the left sidebar
+            self.sample_listbox.selection_clear(0, tk.END)
+
+        # 2. Clear the Default Barcode field (or put a placeholder/blank)
+            self.sample_var.set("")
+
+        # 3. Clear the Results text box
+            self.results_text.delete("1.0", tk.END)
+
+        # 4. Optional: log it to the Live Wire Log if you have a log helper
+            self._log("[*] Ready for new sample entry.")
+            self._update_result_count()
+
+    def _generate_results(self):
+        # Look up which protocol ID ("1".."4") is currently selected
+        proto_label = self.proto_var.get()
+        proto_id = PROTOCOL_BY_LABEL.get(proto_label, "1")
+        panel = SAMPLE_PANELS.get(proto_id, SAMPLE_PANELS["1"])
+
+        lines = []
+        abnormal_count = 0
+
+        for code, low, high, decimals, unit in panel:
+            # 25% chance to throw in an abnormal Low or High value
+            if random.random() < 0.25:
+                abnormal_count += 1
+                if random.choice(["low", "high"]) == "low":
+                    val = max(0.1, low * random.uniform(0.45, 0.85))
+                else:
+                    val = high * random.uniform(1.15, 1.85)
+            else:
+                val = random.uniform(low, high)
+
+            formatted_val = f"{val:.{decimals}f}"
+            lines.append(f"{code}|{formatted_val}|{unit}")
+
+        self.results_text.delete("1.0", tk.END)
+        self.results_text.insert("1.0", "\n".join(lines) + "\n")
+        self._log(f"[*] Generated {len(lines)} results ({abnormal_count} abnormal) for {proto_label}.")
+        self._update_result_count()
 
     def _copy_hercules(self) -> None:
         proto = PROTOCOL_BY_LABEL[self.proto_var.get()]
@@ -1097,7 +1362,14 @@ class LisSimulatorGUI(tk.Tk):
                 except ValueError:
                     continue
 
-        batches = build_payload(proto, uid, sample_id, active_results, self.carets_var.get())
+        try:
+            age_hrs = float(self.age_hours_var.get().strip() or "0")
+        except ValueError:
+            age_hrs = 0.0
+        msg_ts = get_message_timestamp(age_hrs)
+
+        batches = build_payload(proto, uid, sample_id, active_results, self.carets_var.get(), ts=msg_ts)
+
         mode = self.transport_var.get()
         host = self.host_var.get().strip()
         port = int(self.port_var.get().strip() or "7010")
@@ -1122,7 +1394,13 @@ class LisSimulatorGUI(tk.Tk):
                     self.tcp_session = TcpClientSession(host, port)
                     self.tcp_session_key = (host, port)
                 self.tcp_session.open(self.log)
-                self._run_protocol(self.tcp_session.send, self.tcp_session.recv, self.tcp_session.reconnect, proto, batches)
+                self._run_protocol(
+                    self.tcp_session.send,
+                    self.tcp_session.recv,
+                    self.tcp_session.reconnect,
+                    proto,
+                    batches,
+                )
 
             elif mode == "TCP Server":
                 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1133,7 +1411,7 @@ class LisSimulatorGUI(tk.Tk):
                 self.log(f"[*] Listening on {host}:{port} (waiting up to 20s for driver)...")
                 conn, addr = srv.accept()
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.settimeout(3.0)
+                conn.settimeout(15.0)
                 self.log(f"[+] Driver connected from {addr[0]}:{addr[1]}")
                 try:
                     def _recv(sz=1):
@@ -1166,6 +1444,7 @@ class LisSimulatorGUI(tk.Tk):
             self.log(f"[!] Transmission Error: {exc}")
             if self.tcp_session:
                 self.tcp_session.close()
+                self.tcp_session = None
         finally:
             self.after(0, lambda: self.push_btn.configure(state=tk.NORMAL))
 
@@ -1176,25 +1455,26 @@ class LisSimulatorGUI(tk.Tk):
 
             if proto in ("1", "4"):
                 ok = False
-                for attempt in range(1, 4):
-                    self.log(f"[TX] 0x05 (ENQ) [Attempt {attempt}/3]")
+                for attempt in range(1, 6):
+                    if reconnect_fn and getattr(self.tcp_session, "sock", None) is None:
+                        reconnect_fn(self.log)
+                    self.log(f"[TX] 0x05 (ENQ) [Attempt {attempt}/5]")
                     try:
                         send_fn(ENQ)
                         resp = recv_fn(1)
                     except OSError:
+                        if self.tcp_session:
+                            self.tcp_session.close()
                         resp = b""
                     if resp == ACK:
                         self.log("[RX] 0x06 (ACK) - Handshake OK!")
                         ok = True
                         break
-                    self.log(f"[*] No ACK yet (got {resp!r}), retrying...")
-                    if reconnect_fn:
-                        reconnect_fn(self.log)
-                    else:
-                        time.sleep(1.0)
+                    self.log(f"[*] No ACK yet (got {resp!r}), retrying on same connection...")
+                    time.sleep(1.0)
 
                 if not ok:
-                    self.log(f"[!] Handshake failed for {barcode} after 3 attempts.")
+                    self.log(f"[!] Handshake failed for {barcode} after 5 attempts.")
                     return
 
                 for idx, frame in enumerate(payload, start=1):
@@ -1221,36 +1501,120 @@ class LisSimulatorGUI(tk.Tk):
                 self.log(f"[TX] Sending HL7 MLLP for {barcode} ({len(payload)} bytes)...")
                 send_fn(payload)
                 resp = recv_fn(1024)
-                if resp:
-                    self.log(f"[RX] MLLP Reply: {resp!r}")
+                if not resp:
+                    self.log(f"[!] Timeout waiting for HL7 MLLP ACK on {barcode}.")
+                    return
+                self.log(f"[RX] MLLP Reply: {resp!r}")
+                if b"MSA|AE" in resp or b"MSA|AR" in resp or NAK in resp:
+                    self.log(f"[!] LIS/Driver rejected HL7 message for {barcode}!")
+                    return
                 self.log(f"[✓] HL7 Message for {barcode} transmitted cleanly!")
 
             elif proto == "3":
                 self.log(f"[TX] Sending Beckman AU frame for {barcode} ({len(payload)} bytes)...")
                 send_fn(payload)
                 resp = recv_fn(1)
+                if not resp:
+                    self.log(f"[!] Timeout waiting for Beckman AU ACK on {barcode}.")
+                    return
                 self.log(f"[RX] Reply: {resp!r}")
+                if resp == NAK:
+                    self.log(f"[!] Driver returned 0x15 (NAK) for Beckman AU {barcode}!")
+                    return
                 self.log(f"[✓] Beckman AU frame for {barcode} transmitted cleanly!")
 
             if tube_idx < total_tubes:
-                time.sleep(0.5)
+                self.log("[*] Waiting 2.0s before next tube...")
+                time.sleep(2.0)
 
         self.log(f"[✓] All {total_tubes} tube batch(es) completed!")
 
     # ---------------- LOGGING & CLEANUP ----------------
+
+    # ---------------- LOGGING & CHIRON WATCHER ----------------
 
     def log(self, msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_queue.put(f"[{ts}] {msg}")
 
     def _drain_log_queue(self) -> None:
+        self.log_box.tag_config("error", foreground="#f87171")    # Red
+        self.log_box.tag_config("success", foreground="#4ade80")  # Green
+        self.log_box.tag_config("warn", foreground="#facc15")     # Yellow
+        self.log_box.tag_config("driver", foreground="#38bdf8")   # Cyan
+
         while not self.log_queue.empty():
             line = self.log_queue.get_nowait()
+            lower = line.lower()
+
+            if "[!]" in lower or "[err]" in lower or "error" in lower or "exception" in lower or "failed" in lower or "nak" in lower:
+                tag = "error"
+            elif "upload of result" in lower or "[✓]" in lower:
+                tag = "success"
+            elif "[driver]" in lower:
+                tag = "driver"
+            elif "[warn]" in lower or "retrying" in lower:
+                tag = "warn"
+            else:
+                tag = None
+
             self.log_box.configure(state=tk.NORMAL)
-            self.log_box.insert(tk.END, line + "\n")
+            if tag:
+                self.log_box.insert(tk.END, line + "\n", tag)
+            else:
+                self.log_box.insert(tk.END, line + "\n")
             self.log_box.see(tk.END)
             self.log_box.configure(state=tk.DISABLED)
         self.after(100, self._drain_log_queue)
+
+    def _start_chiron_log_watcher(self) -> None:
+        threading.Thread(target=self._watch_chiron_log, daemon=True).start()
+
+    def _get_latest_chiron_log(self) -> str | None:
+        files = glob.glob(os.path.join(CHIRON_DIR, "*console.log"))
+        if not files:
+            return None
+        return max(files, key=os.path.getmtime)
+
+    def _watch_chiron_log(self) -> None:
+        current_path = self._get_latest_chiron_log()
+        if not current_path:
+            self.log(f"[WARN] No *console.log found in: {CHIRON_DIR}")
+            return
+
+        self.log(f"[*] Watching Chiron driver log: {os.path.basename(current_path)}")
+        f = open(current_path, "r", encoding="utf-8", errors="replace")
+        f.seek(0, os.SEEK_END)  # Start at end so old history isn't replayed
+
+        try:
+            while True:
+                line = f.readline()
+                if not line:
+                    # Check if Chiron was restarted and created a newer GUID*console.log
+                    newest = self._get_latest_chiron_log()
+                    if newest and newest != current_path:
+                        f.close()
+                        current_path = newest
+                        f = open(current_path, "r", encoding="utf-8", errors="replace")
+                        self.log(f"[*] Switched to new Chiron log: {os.path.basename(current_path)}")
+                    time.sleep(0.2)
+                    continue
+
+                clean = line.strip()
+                if not clean:
+                    continue
+
+                lower = clean.lower()
+                if any(w in lower for w in ("error", "exception", "failed", "warning", "timeout", "nak", "rejected")):
+                    self.log(f"[!] [DRIVER] {clean}")
+                elif "upload of result" in lower and "complete" in lower:
+                    self.log(f"[✓] [DRIVER] {clean}")
+                elif any(w in lower for w in ("uploading translated", "submitted results", "payload was processed")):
+                    self.log(f"[DRIVER] {clean}")
+        except Exception as exc:
+            self.log(f"[!] Chiron log watcher stopped: {exc}")
+        finally:
+            f.close()
 
     def _clear_log(self) -> None:
         self.log_box.configure(state=tk.NORMAL)
