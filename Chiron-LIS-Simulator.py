@@ -35,7 +35,7 @@ BASE_DIR = (
 SAMPLES_DIR = BASE_DIR / "saved_samples"
 TUBE_MEMORY_FILE = BASE_DIR / "tube_memory.json"
 
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 GITHUB_REPO = "ShivarenP/PYTHON" 
 
 COMMON_TUBES = [
@@ -784,11 +784,18 @@ class ForcedUpdateDialog(tk.Toplevel):
 def _apply_and_restart(self, current_exe: Path, staged_exe: Path) -> None:
         bat_path = current_exe.with_name("_chiron_sim_update.bat")
         bat_script = f"""@echo off
+set /a tries=0
 :retry
 timeout /t 1 /nobreak >nul
+set /a tries+=1
+del /f /q "{current_exe}" >nul 2>&1
+if exist "{current_exe}" (
+    if %tries% LSS 20 goto retry
+    exit /b 1
+)
 move /y "{staged_exe}" "{current_exe}" >nul 2>&1
-if exist "{staged_exe}" goto retry
-explorer.exe "{current_exe}"
+if not exist "{current_exe}" exit /b 1
+start "" /d "{current_exe.parent}" "{current_exe}"
 del "%~f0"
 """
         bat_path.write_text(bat_script, encoding="utf-8")
@@ -798,9 +805,10 @@ del "%~f0"
             if not k.startswith(("_PYI_", "_MEI", "TCL_", "TK_"))
         }
         subprocess.Popen(
-            ["cmd", "/c", str(bat_path)],
+            ["cmd.exe", "/c", str(bat_path)],
+            cwd=str(current_exe.parent),
             env=clean_env,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
             close_fds=True,
         )
         os._exit(0)
