@@ -35,7 +35,7 @@ BASE_DIR = (
 SAMPLES_DIR = BASE_DIR / "saved_samples"
 TUBE_MEMORY_FILE = BASE_DIR / "tube_memory.json"
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 GITHUB_REPO = "ShivarenP/PYTHON" 
 
 COMMON_TUBES = [
@@ -817,6 +817,10 @@ class LisSimulatorGUI(tk.Tk):
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.tcp_session: TcpClientSession | None = None
         self.tcp_session_key: tuple[str, int] | None = None
+        self.tcp_server_sock: socket.socket | None = None
+        self.tcp_server_conn: socket.socket | None = None
+        self.serial_session = None
+        self.is_connected: bool = False
         self.push_counter: dict[str, int] = {}
         self.saved_files: list[Path] = []
 
@@ -1073,8 +1077,20 @@ class LisSimulatorGUI(tk.Tk):
         )
         self.baud_combo.grid(row=1, column=3, sticky="w", pady=(6, 0))
 
-        self.push_btn = ttk.Button(trans_frame, text="PUSH SAMPLE", command=self._on_push_clicked)
-        self.push_btn.grid(row=1, column=4, columnspan=2, sticky="e", pady=(6, 0))
+        self.conn_status_var = tk.StringVar(value="● Disconnected")
+        self.conn_status_lbl = ttk.Label(
+            trans_frame, textvariable=self.conn_status_var, foreground="#dc2626", font=("Segoe UI", 9, "bold")
+        )
+        self.conn_status_lbl.grid(row=1, column=3, sticky="e", padx=(0, 8), pady=(6, 0))
+
+        btn_box = ttk.Frame(trans_frame)
+        btn_box.grid(row=1, column=4, columnspan=2, sticky="e", pady=(6, 0))
+
+        self.connect_btn = ttk.Button(btn_box, text="Connect", command=self._on_connect_toggle)
+        self.connect_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.push_btn = ttk.Button(btn_box, text="PUSH SAMPLE", command=self._on_push_clicked)
+        self.push_btn.pack(side=tk.LEFT)
 
         self._on_transport_changed()
 
@@ -1115,6 +1131,8 @@ class LisSimulatorGUI(tk.Tk):
             self.carets_chk.configure(state=tk.DISABLED)
 
     def _on_transport_changed(self, _event=None) -> None:
+        if getattr(self, "is_connected", False):
+            self._disconnect_transport(silent=True)
         mode = self.transport_var.get()
         is_serial = mode == "Serial COM"
         self.host_entry.configure(state=tk.DISABLED if is_serial else tk.NORMAL)
@@ -1311,6 +1329,114 @@ class LisSimulatorGUI(tk.Tk):
 
     # ---------------- TRANSMISSION WORKER ----------------
 
+    def _set_conn_state(self, connected: bool, label: str | None = None) -> None:
+        self.is_connected = connected
+        if connected:
+            self.conn_status_var.set(label or "● Connected")
+            self.conn_status_lbl.configure(foreground="#16a34a")
+            self.connect_btn.configure(text="Disconnect", state=tk.NORMAL)
+        else:
+            self.conn_status_var.set(label or "● Disconnected")
+            self.conn_status_lbl.configure(foreground="#dc2626")
+            self.connect_btn.configure(text="Connect", state=tk.NORMAL)
+
+    def _on_connect_toggle(self) -> None:
+        if self.is_connected:
+            self._disconnect_transport()
+            return
+
+        mode = self.transport_var.get()
+        host = self.host_var.get().strip()
+        port = int(self.port_var.get().strip() or "7010")
+        com_port = self.com_var.get().strip()
+        baud = int(self.baud_var.get().strip() or "9600")
+
+        self.connect_btn.configure(state=tk.DISABLED)
+        self.conn_status_var.set("● Connecting...")
+        self.conn_status_lbl.configure(foreground="#d97706")
+
+        threading.Thread(
+            target=self._connect_worker,
+            args=(mode, host, port, com_port, baud),
+            daemon=True,
+        ).start()
+
+    def _connect_worker(self, mode: str, host: str, port: int, com_port: str, baud: int) -> None:
+        try:
+            if mode == "TCP Client":
+                if self.tcp_session:
+                    self.tcp_session.close()
+                sess = TcpClientSession(host, port)
+                sess.open(self.log)
+                self.tcp_session = sess
+                self.tcp_session_key = (host, port)
+                self.log(f"[✓] Connected (TCP Client) -> {host}:{port}")
+                self.after(0, lambda: self._set_conn_state(True, f"● Connected ({host}:{port})"))
+
+            elif mode == "TCP Server":
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind((host, port))
+                srv.listen(1)
+                srv.settimeout(30.0)
+                self.tcp_server_sock = srv
+                self.log(f"[*] TCP Server listening on {host}:{port} (waiting up to 30s for Chiron)...")
+                conn, addr = srv.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.settimeout(15.0)
+                self.tcp_server_conn = conn
+                self.log(f"[✓] Driver connected from {addr[0]}:{addr[1]}")
+                self.after(0, lambda: self._set_conn_state(True, f"● Client {addr[0]}:{addr[1]}"))
+
+            elif mode == "Serial COM":
+                if serial is None:
+                    raise RuntimeError("pyserial not installed. Run: python -m pip install pyserial")
+                self.log(f"[*] Opening {com_port} @ {baud} baud...")
+                ser = serial.Serial(com_port, baudrate=baud, timeout=2.0, dsrdtr=False, rtscts=False)
+                time.sleep(0.25)
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                self.serial_session = ser
+                self.log(f"[✓] Connected (Serial) -> {com_port} @ {baud}")
+                self.after(0, lambda: self._set_conn_state(True, f"● Connected ({com_port})"))
+
+        except Exception as exc:
+            self.log(f"[!] Connect failed: {exc}")
+            self._disconnect_transport(silent=True)
+            self.after(0, lambda: self._set_conn_state(False))
+
+    def _disconnect_transport(self, silent: bool = False) -> None:
+        if self.tcp_session:
+            self.tcp_session.close()
+            self.tcp_session = None
+            self.tcp_session_key = None
+        if self.tcp_server_conn:
+            try:
+                self.tcp_server_conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.tcp_server_conn.close()
+            except OSError:
+                pass
+            self.tcp_server_conn = None
+        if self.tcp_server_sock:
+            try:
+                self.tcp_server_sock.close()
+            except OSError:
+                pass
+            self.tcp_server_sock = None
+        if self.serial_session:
+            try:
+                self.serial_session.close()
+            except OSError:
+                pass
+            self.serial_session = None
+
+        if not silent:
+            self.log("[*] Disconnected transport session.")
+        self.after(0, lambda: self._set_conn_state(False))
+
     def _on_push_clicked(self) -> None:
         proto = PROTOCOL_BY_LABEL[self.proto_var.get()]
         uid = self.uid_var.get().strip() or "INSTRUMENT"
@@ -1388,12 +1514,13 @@ class LisSimulatorGUI(tk.Tk):
     ) -> None:
         try:
             if mode == "TCP Client":
-                if self.tcp_session_key != (host, port) or self.tcp_session is None:
+                if self.tcp_session_key != (host, port) or self.tcp_session is None or self.tcp_session.sock is None:
                     if self.tcp_session:
                         self.tcp_session.close()
                     self.tcp_session = TcpClientSession(host, port)
                     self.tcp_session_key = (host, port)
-                self.tcp_session.open(self.log)
+                    self.tcp_session.open(self.log)
+                    self.after(0, lambda: self._set_conn_state(True, f"● Connected ({host}:{port})"))
                 self._run_protocol(
                     self.tcp_session.send,
                     self.tcp_session.recv,
@@ -1403,48 +1530,51 @@ class LisSimulatorGUI(tk.Tk):
                 )
 
             elif mode == "TCP Server":
-                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                srv.bind((host, port))
-                srv.listen(1)
-                srv.settimeout(20.0)
-                self.log(f"[*] Listening on {host}:{port} (waiting up to 20s for driver)...")
-                conn, addr = srv.accept()
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.settimeout(15.0)
-                self.log(f"[+] Driver connected from {addr[0]}:{addr[1]}")
-                try:
+                if self.tcp_server_conn is not None:
+                    conn = self.tcp_server_conn
                     def _recv(sz=1):
                         try:
                             return conn.recv(sz)
                         except socket.timeout:
                             return b""
                     self._run_protocol(conn.sendall, _recv, None, proto, batches)
-                finally:
-                    conn.close()
-                    srv.close()
+                else:
+                    self._connect_worker(mode, host, port, com_port, baud)
+                    if self.tcp_server_conn:
+                        conn = self.tcp_server_conn
+                        def _recv(sz=1):
+                            try:
+                                return conn.recv(sz)
+                            except socket.timeout:
+                                return b""
+                        self._run_protocol(conn.sendall, _recv, None, proto, batches)
 
             elif mode == "Serial COM":
                 if serial is None:
                     raise RuntimeError("pyserial not installed. Run: python -m pip install pyserial")
-                self.log(f"[*] Opening {com_port} @ {baud} baud...")
-                ser = serial.Serial(com_port, baudrate=baud, timeout=2.0, dsrdtr=False, rtscts=False)
-                time.sleep(0.25)
-                ser.reset_input_buffer()
-                ser.reset_output_buffer()
-                try:
+                if self.serial_session is not None and self.serial_session.is_open:
+                    ser = self.serial_session
                     def _send(d: bytes):
                         ser.write(d)
                         ser.flush()
                     self._run_protocol(_send, ser.read, None, proto, batches)
-                finally:
-                    ser.close()
+                else:
+                    self.log(f"[*] Opening {com_port} @ {baud} baud...")
+                    ser = serial.Serial(com_port, baudrate=baud, timeout=2.0, dsrdtr=False, rtscts=False)
+                    time.sleep(0.25)
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                    try:
+                        def _send(d: bytes):
+                            ser.write(d)
+                            ser.flush()
+                        self._run_protocol(_send, ser.read, None, proto, batches)
+                    finally:
+                        ser.close()
 
         except Exception as exc:
             self.log(f"[!] Transmission Error: {exc}")
-            if self.tcp_session:
-                self.tcp_session.close()
-                self.tcp_session = None
+            self._disconnect_transport(silent=True)
         finally:
             self.after(0, lambda: self.push_btn.configure(state=tk.NORMAL))
 
@@ -1622,8 +1752,7 @@ class LisSimulatorGUI(tk.Tk):
         self.log_box.configure(state=tk.DISABLED)
 
     def _on_close(self) -> None:
-        if self.tcp_session:
-            self.tcp_session.close()
+        self._disconnect_transport(silent=True)
         self.destroy()
 
 
