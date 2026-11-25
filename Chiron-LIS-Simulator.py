@@ -34,7 +34,7 @@ BASE_DIR = (
 SAMPLES_DIR = BASE_DIR / "saved_samples"
 TUBE_MEMORY_FILE = BASE_DIR / "tube_memory.json"
 
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 GITHUB_REPO = "ShivarenP/PYTHON"
 
 COMMON_TUBES = [
@@ -81,6 +81,7 @@ PROTOCOLS = {
     "2": "HL7 (v2.x MLLP)",
     "3": "Beckman AU Native ASCII",
     "4": "Cobas e411 (Elecsys ASTM)",
+    "5": "Siemens CA-600 / CS-2500 (Bidir ASTM)",
 }
 
 PROTOCOL_BY_LABEL = {v: k for k, v in PROTOCOLS.items()}
@@ -118,6 +119,13 @@ SAMPLE_PANELS = {
         ("FERR", 30, 300, 0, "ng/mL"),
         ("VITD", 50.0, 125.0, 1, "nmol/L"),
         ("HBA1C", 4.5, 6.4, 1, "%"),
+    ],
+    "5": [  # Siemens CA-600 / CS-2500 - Coagulation
+        ("PT", 10.5, 13.5, 1, "sec"),
+        ("INR", 0.90, 1.15, 2, "INR"),
+        ("APTT", 25.0, 36.0, 1, "sec"),
+        ("FIB", 2.00, 4.00, 2, "g/L"),
+        ("TT", 14.0, 19.0, 1, "sec"),
     ],
 }
 
@@ -329,14 +337,16 @@ def build_astm_frames(
 ) -> list[bytes]:
     ts = ts or datetime.now().strftime("%Y%m%d%H%M%S")
     prefix = "^^^" if use_carets else ""
-    test_ids = "\\".join(f"{prefix}{c}" for c, _, _ in items)
+    suffix = "^" if use_carets else ""
+    test_ids = "\\".join(f"{prefix}{c}{suffix}" for c, _, _ in items)
+    form_no = barcode.split("-")[0] if "-" in barcode else barcode
     records = [
         rf"H|\^&|||{source_uid}|||||||P|1|{ts}",
-        "P|1",
-        f"O|1|{barcode}||{test_ids}|||||||N",
+        f"P|1|{form_no}",
+        f"O|1|0001^01^{barcode}^B|{barcode}|{test_ids}|||||||N",
     ]
     for res_seq, (code, val, unit) in enumerate(items, start=1):
-        records.append(f"R|{res_seq}|{prefix}{code}|{val}|{unit}||N||F||||{ts}")
+        records.append(f"R|{res_seq}|{prefix}{code}{suffix}|{val}|{unit}||N||F||||{ts}")
     records.append("L|1|N")
     return wrap_astm_records(records)
 
@@ -356,6 +366,16 @@ def build_single_cobas_frames(
     records.append("L|1|")
     return wrap_astm_records(records)
 
+def build_single_ca600_query_frames(
+    source_uid: str, barcode: str, rack: str = "0001", pos: str = "01", ts: str | None = None
+) -> list[bytes]:
+    ts = ts or datetime.now().strftime("%Y%m%d%H%M%S")
+    records = [
+        rf"H|\^&|||{source_uid}|||||||P|LIS02-A2|{ts}",
+        f"Q|1|{rack}^{pos}^{barcode}^B||^^^ALL||||||||N",
+        "L|1|N",
+    ]
+    return wrap_astm_records(records)
 
 def build_hl7(
     source_uid: str,
@@ -396,8 +416,8 @@ def build_payload(
     """Returns a list of (barcode, payload) batches so every barcode is sent as Orders[0]."""
     batches: list[tuple[str, list[bytes] | bytes]] = []
     for barcode, items in group_by_barcode(default_sample_id, results):
-        if proto == "1":
-            batches.append((barcode, build_astm_frames(source_uid, barcode, items, use_carets, ts=ts)))
+        if proto in ("1", "5"):
+            batches.append((barcode, build_astm_frames(source_uid, barcode, items, True if proto == "5" else use_carets, ts=ts)))
         elif proto == "2":
             batches.append((barcode, build_hl7(source_uid, barcode, items, ts=ts)))
         elif proto == "3":
@@ -1215,6 +1235,9 @@ class LisSimulatorGUI(tk.Tk):
         self.connect_btn = ttk.Button(btn_box, text="Connect", command=self._on_connect_toggle)
         self.connect_btn.pack(side=tk.LEFT, padx=(0, 6))
 
+        self.query_btn = ttk.Button(btn_box, text="QUERY ORDERS", command=self._on_query_clicked)
+        self.query_btn.pack(side=tk.LEFT, padx=(0, 6))
+
         self.push_btn = ttk.Button(btn_box, text="PUSH SAMPLE", command=self._on_push_clicked)
         self.push_btn.pack(side=tk.LEFT)
 
@@ -1249,9 +1272,14 @@ class LisSimulatorGUI(tk.Tk):
 
     def _on_proto_changed(self, _event=None) -> None:
         proto = PROTOCOL_BY_LABEL[self.proto_var.get()]
-        if proto == "4":
+        if proto in ("4", "5"):
             self.carets_var.set(True)
             self.carets_chk.configure(state=tk.DISABLED)
+            if proto == "5":
+                self.uid_var.set("SiemansCS2500")
+                self.port_var.set("7060")
+                self.transport_var.set("TCP Client")
+                self._on_transport_changed()
         elif proto == "1":
             self.carets_chk.configure(state=tk.NORMAL)
         else:
@@ -1396,9 +1424,55 @@ class LisSimulatorGUI(tk.Tk):
         proto_id = PROTOCOL_BY_LABEL.get(proto_label, "1")
         panel = SAMPLE_PANELS.get(proto_id, SAMPLE_PANELS["1"])
 
-        lines = []
+        # Build lookup across all panels so any downloaded test code gets realistic ranges
+        range_lookup: dict[str, tuple[float, float, int, str]] = {}
+        for p_items in SAMPLE_PANELS.values():
+            for c, lo, hi, dec, u in p_items:
+                range_lookup[c.upper()] = (lo, hi, dec, u)
+
+        existing_raw = self.results_text.get("1.0", tk.END).strip()
+        existing_rows = [ln.strip() for ln in existing_raw.splitlines() if ln.strip()]
+
+        # Check if the box currently holds host-ordered tests (e.g. "PT||sec|85308824-CIT1")
+        has_blank_orders = any(
+            len(ln.split("|")) >= 2 and ln.split("|")[1].strip() == ""
+            for ln in existing_rows
+        )
+
+        lines: list[str] = []
         abnormal_count = 0
 
+        if has_blank_orders:
+            for ln in existing_rows:
+                parts = [p.strip() for p in ln.split("|")]
+                code = parts[0]
+                unit = parts[2] if len(parts) > 2 else ""
+                barcode_ov = parts[3] if len(parts) > 3 else ""
+
+                lo, hi, dec, default_u = range_lookup.get(code.upper(), (1.0, 20.0, 1, unit or "U/L"))
+                if not unit:
+                    unit = default_u
+
+                if random.random() < 0.25:
+                    abnormal_count += 1
+                    val = max(0.1, lo * random.uniform(0.45, 0.85)) if random.choice(["low", "high"]) == "low" else hi * random.uniform(1.15, 1.85)
+                else:
+                    val = random.uniform(lo, hi)
+
+                formatted_val = f"{val:.{dec}f}"
+                lines.append(
+                    f"{code}|{formatted_val}|{unit}|{barcode_ov}"
+                    if barcode_ov
+                    else f"{code}|{formatted_val}|{unit}"
+                )
+
+            self.results_text.delete("1.0", tk.END)
+            self.results_text.insert("1.0", "\n".join(lines) + "\n")
+            self.log(f"[*] Generated fictional values for {len(lines)} host-ordered test(s) ({abnormal_count} abnormal).")
+            self._update_result_count()
+            return
+
+        # Fallback: generate a fresh sample panel when no blank host orders are present
         for code, low, high, decimals, unit in panel:
             if random.random() < 0.25:
                 abnormal_count += 1
@@ -1556,6 +1630,164 @@ class LisSimulatorGUI(tk.Tk):
             self.log("[*] Disconnected transport session.")
         self.after(0, lambda: self._set_conn_state(False))
 
+    def _on_query_clicked(self) -> None:
+        uid = self.uid_var.get().strip() or "SiemansCS2500"
+        raw_input = self.sample_var.get().strip()
+        if not raw_input:
+            messagebox.showwarning("Missing Barcode", "Enter a Default Barcode or Requisition # (e.g. 85308833 or 85308833-EDTA1).")
+            return
+
+        # Expand bare requisition numbers (e.g. "85308833") across all common tube suffixes
+        raw_tokens = [b.strip() for b in re.split(r"[,;\s]+", raw_input) if b.strip()]
+        barcodes: list[str] = []
+        for tok in raw_tokens:
+            if "-" not in tok:
+                for tube in COMMON_TUBES:
+                    if tube != "(Default Barcode)":
+                        barcodes.append(f"{tok}-{tube}")
+            else:
+                barcodes.append(tok)
+
+        mode = self.transport_var.get()
+        host = self.host_var.get().strip()
+        port = int(self.port_var.get().strip() or "7060")
+
+        self.query_btn.configure(state=tk.DISABLED)
+        threading.Thread(
+            target=self._query_worker,
+            args=(mode, host, port, uid, barcodes),
+            daemon=True,
+        ).start()
+
+    def _query_worker(
+        self, mode: str, host: str, port: int, uid: str, barcodes: list[str]
+    ) -> None:
+        try:
+            if mode != "TCP Client":
+                self.log("[!] Set Mode to 'TCP Client' for Siemens CA-600 driver (ServerMode=true on port 7060).")
+                return
+
+            if self.tcp_session_key != (host, port) or self.tcp_session is None or self.tcp_session.sock is None:
+                if self.tcp_session:
+                    self.tcp_session.close()
+                self.tcp_session = TcpClientSession(host, port)
+                self.tcp_session_key = (host, port)
+                self.tcp_session.open(self.log)
+                self.after(0, lambda: self._set_conn_state(True, f"● Connected ({host}:{port})"))
+
+            send_fn = self.tcp_session.send
+            recv_fn = self.tcp_session.recv
+
+            all_downloaded: list[tuple[str, str]] = []
+
+            for idx_bc, bc in enumerate(barcodes, start=1):
+                frames = build_single_ca600_query_frames(uid, bc)
+                self.log(f"=== [{idx_bc}/{len(barcodes)}] Querying Chiron for {bc} ===")
+
+                send_fn(ENQ)
+                if recv_fn(1) != ACK:
+                    self.log(f"[!] No ACK to ENQ for {bc}. Reconnecting...")
+                    self.tcp_session.reconnect(self.log)
+                    send_fn(ENQ)
+                    if recv_fn(1) != ACK:
+                        self.log(f"[!] Still no ACK for {bc}, skipping.")
+                        continue
+
+                for f_idx, frame in enumerate(frames, start=1):
+                    preview = frame[1:-4].decode("ascii", errors="replace").replace("\r", " ")
+                    self.log(f"[TX] Frame {f_idx}/{len(frames)}: {preview}")
+                    send_fn(frame)
+                    if recv_fn(1) != ACK:
+                        self.log(f"[!] Driver did not ACK frame {f_idx} for {bc}.")
+                        break
+                send_fn(EOT)
+
+                # Wait up to 12s for Chiron's cloud API lookup + outbound ENQ
+                incoming_records: list[str] = []
+                deadline = time.time() + (12.0 if len(barcodes) == 1 else 8.0)
+                got_enq = False
+                while time.time() < deadline:
+                    b = recv_fn(1)
+                    if b == ENQ:
+                        got_enq = True
+                        self.log(f"[RX] 0x05 (ENQ) from Chiron for {bc} -> Sending ACK")
+                        send_fn(ACK)
+                        break
+
+                if not got_enq:
+                    self.log(f"[*] No orders returned for {bc}.")
+                    continue
+
+                buf = b""
+                dl_deadline = time.time() + 8.0
+                while time.time() < dl_deadline:
+                    chunk = recv_fn(1024)
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    while b"\r\n" in buf:
+                        line, buf = buf.split(b"\r\n", 1)
+                        if line.startswith(b"\x02") and len(line) > 5:
+                            payload_txt = line[2:-3].decode("ascii", errors="replace")
+                            for sub_rec in payload_txt.split("\r"):
+                                sub_rec = sub_rec.strip()
+                                if sub_rec:
+                                    incoming_records.append(sub_rec)
+                                    self.log(f"[RX] Record: {sub_rec}")
+                            send_fn(ACK)
+                    if EOT in buf:
+                        self.log(f"[RX] 0x04 (EOT) - Host Order Download Complete for {bc}!")
+                        break
+
+                current_o_barcode = bc
+                for rec in incoming_records:
+                    if rec.startswith("O|"):
+                        fields = rec.split("|")
+                        if len(fields) > 2 and fields[2].strip():
+                            id_parts = [p.strip() for p in fields[2].split("^")]
+                            if len(id_parts) >= 3 and id_parts[2]:
+                                current_o_barcode = id_parts[2]
+                            elif id_parts[0]:
+                                current_o_barcode = id_parts[0]
+                        if len(fields) > 4 and fields[4].strip():
+                            for item in fields[4].split("\\"):
+                                clean_item = item.lstrip("^").strip()
+                                code = clean_item.split("^")[0].strip()
+                                if code:
+                                    all_downloaded.append((code, current_o_barcode))
+
+                # Give Chiron ~0.5s to resume its listener before querying the next tube
+                if idx_bc < len(barcodes):
+                    time.sleep(0.5)
+
+            if all_downloaded:
+                summary = ", ".join(f"{c} ({b})" for c, b in all_downloaded)
+                self.log(f"[✓] Total downloaded: {len(all_downloaded)} test(s) -> {summary}")
+
+                unit_lookup: dict[str, str] = {}
+                for panel_items in SAMPLE_PANELS.values():
+                    for c, _lo, _hi, _dec, u in panel_items:
+                        unit_lookup[c.upper()] = u
+
+                rows = []
+                for code, b in all_downloaded:
+                    unit = unit_lookup.get(code.upper(), "sec" if code.upper() in ("PT", "APTT", "TT") else "")
+                    rows.append(f"{code}||{unit}|{b}")
+
+                self.after(0, lambda r="\n".join(rows) + "\n": (
+                    self.results_text.delete("1.0", tk.END),
+                    self.results_text.insert("1.0", r),
+                    self._update_result_count(),
+                    self.log("[*] Results box populated! Enter values or click 'Generate Results', then 'PUSH SAMPLE'."),
+                ))
+            else:
+                self.log("[WARN] Chiron returned no pending orders for any queried tube.")
+
+        except Exception as exc:
+            self.log(f"[!] Bidirectional Query Error: {exc}")
+        finally:
+            self.after(0, lambda: self.query_btn.configure(state=tk.NORMAL))
+
     def _on_push_clicked(self) -> None:
         proto = PROTOCOL_BY_LABEL[self.proto_var.get()]
         uid = self.uid_var.get().strip() or "INSTRUMENT"
@@ -1702,7 +1934,7 @@ class LisSimulatorGUI(tk.Tk):
         for tube_idx, (barcode, payload) in enumerate(batches, start=1):
             self.log(f"=== Transmitting Tube {tube_idx}/{total_tubes}: {barcode} ===")
 
-            if proto in ("1", "4"):
+            if proto in ("1", "4", "5"):
                 ok = False
                 for attempt in range(1, 6):
                     if reconnect_fn and getattr(self.tcp_session, "sock", None) is None:
