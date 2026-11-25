@@ -34,7 +34,7 @@ BASE_DIR = (
 SAMPLES_DIR = BASE_DIR / "saved_samples"
 TUBE_MEMORY_FILE = BASE_DIR / "tube_memory.json"
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 GITHUB_REPO = "ShivarenP/PYTHON"
 
 COMMON_TUBES = [
@@ -682,6 +682,33 @@ def fetch_latest_github_release(repo: str) -> dict | None:
         pass
     return None
 
+def fetch_all_github_releases(repo: str) -> list[dict]:
+    if not repo or "YOUR_GITHUB_USERNAME" in repo:
+        return []
+    api_url = f"https://api.github.com/repos/{repo}/releases?per_page=20"
+    req = urllib.request.Request(
+        api_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Chiron-LIS-Simulator-Updater",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            items = json.loads(resp.read().decode("utf-8"))
+        releases: list[dict] = []
+        for item in items:
+            if item.get("draft"):
+                continue
+            tag = str(item.get("tag_name", "")).strip()
+            body = str(item.get("body", "")).strip() or "No release notes provided."
+            published = str(item.get("published_at", ""))[:10]
+            if tag:
+                releases.append({"version": tag, "date": published, "changelog": body})
+        return releases
+    except Exception:
+        return []
+
 
 class ForcedUpdateDialog(tk.Toplevel):
     """Non-dismissible modal that displays the changelog and forces update installation."""
@@ -704,6 +731,75 @@ class ForcedUpdateDialog(tk.Toplevel):
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
 
         self.after(300, self._start_download)
+
+class ChangelogHistoryDialog(tk.Toplevel):
+    """Scrollable viewer showing all previous GitHub release changelogs."""
+
+    def __init__(self, parent: tk.Tk):
+        super().__init__(parent)
+        self.title(f"Release History & Changelogs (Current: v{APP_VERSION})")
+        self.geometry("620x480")
+        self.minsize(500, 360)
+        self.transient(parent)
+
+        self.theme = THEMES["dark" if getattr(parent, "dark_mode", False) else "light"]
+        self.configure(bg=self.theme["bg"])
+
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text=f"Chiron LIS Simulator — Release Notes (Installed: v{APP_VERSION})",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 8))
+
+        self.text_box = scrolledtext.ScrolledText(
+            frame,
+            font=("Segoe UI", 9),
+            wrap=tk.WORD,
+            bg=self.theme["input_bg"],
+            fg=self.theme["input_fg"],
+            insertbackground=self.theme["input_fg"],
+            highlightbackground=self.theme["border"],
+        )
+        self.text_box.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self.text_box.tag_config("ver_hdr", font=("Segoe UI", 11, "bold"), foreground=self.theme["accent"])
+        self.text_box.tag_config("meta", font=("Segoe UI", 8), foreground=self.theme["muted"])
+
+        self.text_box.insert("1.0", "Loading release history from GitHub...")
+        self.text_box.configure(state=tk.DISABLED)
+
+        ttk.Button(frame, text="Close", command=self.destroy).pack(anchor="e")
+
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        threading.Thread(target=self._load_worker, daemon=True).start()
+
+    def _load_worker(self) -> None:
+        releases = fetch_all_github_releases(GITHUB_REPO)
+        self.after(0, lambda: self._populate(releases))
+
+    def _populate(self, releases: list[dict]) -> None:
+        if not self.winfo_exists():
+            return
+        self.text_box.configure(state=tk.NORMAL)
+        self.text_box.delete("1.0", tk.END)
+        if not releases:
+            self.text_box.insert("1.0", "Could not load release notes (check internet connection or GitHub releases).")
+        else:
+            for idx, rel in enumerate(releases):
+                if idx > 0:
+                    self.text_box.insert(tk.END, "\n" + ("─" * 58) + "\n\n")
+                current_badge = "  (Current)" if rel["version"].lstrip("vV") == APP_VERSION.lstrip("vV") else ""
+                self.text_box.insert(tk.END, f"{rel['version']}{current_badge}\n", "ver_hdr")
+                if rel["date"]:
+                    self.text_box.insert(tk.END, f"Released: {rel['date']}\n\n", "meta")
+                self.text_box.insert(tk.END, rel["changelog"] + "\n")
+        self.text_box.configure(state=tk.DISABLED)
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self, padding=16)
@@ -933,9 +1029,10 @@ class LisSimulatorGUI(tk.Tk):
         guard_file = BASE_DIR / ".update_attempted"
         if guard_file.exists():
             try:
-                if time.time() - guard_file.stat().st_mtime < 30:
-                    return
+                age = time.time() - guard_file.stat().st_mtime
                 guard_file.unlink(missing_ok=True)
+                if age < 30:
+                    return
             except OSError:
                 pass
 
@@ -1136,6 +1233,7 @@ class LisSimulatorGUI(tk.Tk):
         log_btns.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(log_btns, text="Clear Log", command=self._clear_log).pack(side=tk.RIGHT)
         ttk.Button(log_btns, text="Copy Log", command=self._copy_log).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(log_btns, text="Changelogs", command=lambda: ChangelogHistoryDialog(self)).pack(side=tk.LEFT)
 
         self.theme_btn = ttk.Button(log_btns, text="Dark Mode", command=self._toggle_theme)
         self.theme_btn.pack(side=tk.RIGHT, padx=(0, 6))
